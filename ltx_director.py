@@ -593,7 +593,19 @@ class LTXDirector(io.ComfyNode):
                     (1, z_channels, num_audio_latents, audio_freq),
                     device=comfy.model_management.intermediate_device(),
                 )
-                return {"samples": audio_latents, "type": "audio"}
+
+                # For pure generation, we mask the entire latent with 1.0 (generate new content)
+                mask = torch.ones(
+                    (1, num_audio_latents, audio_freq),
+                    dtype=torch.float32,
+                    device=comfy.model_management.intermediate_device()
+                )
+
+                return {
+                    "samples": audio_latents,
+                    "type": "audio",
+                    "noise_mask": mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1]))
+                }
 
             if use_custom_audio:
                 try:

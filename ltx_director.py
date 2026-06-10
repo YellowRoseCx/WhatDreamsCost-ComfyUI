@@ -154,7 +154,7 @@ def _compress_image(tensor: torch.Tensor, crf: int) -> torch.Tensor:
         return tensor
 
 
-def _build_combined_audio(timeline_data_str: str, duration_frames: int, frame_rate: float, target_sr: int = 16000) -> dict:
+def _build_combined_audio(timeline_data_str: str, duration_frames: int, frame_rate: float, target_sr: int) -> dict:
     """Parses timeline JSON, loads/trims audio directly from memory using PyAV, 
     and aligns to a global timeline yielding ComfyUI's format.
     Output length explicitly mimics the timeline's duration_frames length."""
@@ -575,11 +575,14 @@ class LTXDirector(io.ComfyNode):
         )
 
 
-        target_sr = 16000
+        target_sr = 44100
         if audio_vae is not None:
+            # Determine the expected output sample rate from the VAE directly, similar to standard LTX audio nodes
             inner = getattr(audio_vae, "first_stage_model", audio_vae)
-            if hasattr(inner, "sampling_rate"):
-                target_sr = inner.sampling_rate
+            if hasattr(inner, "output_sample_rate"):
+                target_sr = int(inner.output_sample_rate)
+            elif hasattr(inner, "sampling_rate"):
+                target_sr = int(inner.sampling_rate)
 
         # --- Build Audio Output ---
         audio_out = _build_combined_audio(timeline_data, ltxv_length, float(frame_rate), target_sr)
@@ -599,19 +602,7 @@ class LTXDirector(io.ComfyNode):
                     (1, z_channels, num_audio_latents, audio_freq),
                     device=comfy.model_management.intermediate_device(),
                 )
-
-                # For pure generation, we mask the entire latent with 1.0 (generate new content)
-                mask = torch.ones(
-                    (1, num_audio_latents, audio_freq),
-                    dtype=torch.float32,
-                    device=comfy.model_management.intermediate_device()
-                )
-
-                return {
-                    "samples": audio_latents,
-                    "type": "audio",
-                    "noise_mask": mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1]))
-                }
+                return {"samples": audio_latents, "type": "audio"}
 
             if use_custom_audio:
                 try:
@@ -639,7 +630,12 @@ class LTXDirector(io.ComfyNode):
                             raise ValueError("Encoded audio latent is empty (0 elements).")
                         
                         # 2. Create mask starting with 1.0 (generate noise everywhere)
-                        mask = torch.ones_like(latent_samples)
+                        mask = torch.full(
+                            (1, latent_samples.shape[-2], latent_samples.shape[-1]),
+                            1.0,
+                            dtype=torch.float32,
+                            device=comfy.model_management.intermediate_device()
+                        )
                         
                         # 3. Punch holes (0.0) where custom audio segments exist to preserve them
                         tdata = json.loads(timeline_data) if timeline_data else {}
@@ -650,12 +646,19 @@ class LTXDirector(io.ComfyNode):
 
                             start_idx = int((start_sec / total_sec) * latent_samples.shape[2])
                             end_idx = int(((start_sec + len_sec) / total_sec) * latent_samples.shape[2])
-                            mask[:, :, start_idx:end_idx, :] = 0.0
 
+                            # Ensure bounds
+                            start_idx = max(0, start_idx)
+                            end_idx = min(latent_samples.shape[2], end_idx)
+
+                            if end_idx > start_idx:
+                                mask[:, start_idx:end_idx, :] = 0.0
+
+                        # 4. Set Latent Noise Mask with proper 4D reshaping for ComfyUI
                         audio_latent = {
                             "samples": latent_samples,
                             "type": "audio",
-                            "noise_mask": mask
+                            "noise_mask": mask.reshape((-1, 1, mask.shape[-2], mask.shape[-1]))
                         }
                         log.info("[PromptRelay] Generated custom audio latent with dynamic noise mask.")
                     else:
